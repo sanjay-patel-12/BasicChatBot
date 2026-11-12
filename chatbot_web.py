@@ -1,7 +1,48 @@
-from flask import Flask, render_template_string, request, jsonify
+"""Rule-based chatbot served by Flask.
+
+Flow: browser -> POST /ask {"message": "..."} -> SimpleChatbot.ask -> JSON reply.
+
+Matching is whole-word and longest-phrase-first, so "which course" is not read as
+a greeting just because it contains "hi", and "tell me a joke" wins over "joke".
+"""
+import os
+import re
+
 from datetime import datetime
 
+from flask import Flask, jsonify, render_template_string, request
+
+MAX_MESSAGE_LENGTH = 500
+
+_WORD_RE = re.compile(r"[a-z0-9]+")
+
 app = Flask(__name__)
+
+
+def _tokens(text):
+    """Return lowercase word tokens with apostrophes removed.
+
+    Example: ``_tokens("What's up?")`` returns ``["whats", "up"]``, so "whats up"
+    and "what's up" reach the same rule.
+    """
+    normalised = str(text).lower().replace("\u2019", "'").replace("'", "")
+    return _WORD_RE.findall(normalised)
+
+
+def _has_phrase(tokens, phrase):
+    """Return whether ``phrase`` appears in ``tokens`` as consecutive words.
+
+    Example: ``_has_phrase(["this", "is"], ["hi"])`` returns ``False`` because a
+    whole word must match, while ``_has_phrase(["hi", "there"], ["hi"])`` is True.
+    """
+    size = len(phrase)
+    if size == 0 or size > len(tokens):
+        return False
+    return any(
+        tokens[index:index + size] == phrase
+        for index in range(len(tokens) - size + 1)
+    )
+
 
 class SimpleChatbot:
     def __init__(self):
@@ -39,21 +80,35 @@ class SimpleChatbot:
             "what is your favorite color": "I don't have eyes, but I think I would like blue! It's calming.",
             "what is your favorite food": "I don't eat, but I hear pizza is quite popular!",
         }
+        # Longest phrase first, so a specific rule beats a generic one.
+        self._compiled_rules = sorted(
+            (
+                (_tokens(question), answer)
+                for question, answer in self.rules.items()
+            ),
+            key=lambda item: len(item[0]),
+            reverse=True,
+        )
 
     def ask(self, user_input):
-        user_input_lower = user_input.lower()
-        # Dynamic time reply
-        if "time" in user_input_lower:
-            now = datetime.now().strftime("%H:%M:%S")
-            return f"The current time is {now}"
-        # Match rules
-        for key in self.rules:
-            if key in user_input_lower:
-                return self.rules[key]
+        """Return the reply for one user message.
+
+        Example: "which course should I take" reaches the fallback because "hi"
+        only matches as a whole word, while "hi there" gets the greeting.
+        """
+        tokens = _tokens(user_input or "")
+        if not tokens:
+            return self.fallback_response
+        # Matched as a whole word, so "sometimes" is not a request for the time.
+        if _has_phrase(tokens, ["time"]):
+            return f"The current time is {datetime.now().strftime('%H:%M:%S')}"
+        for phrase, answer in self._compiled_rules:
+            if _has_phrase(tokens, phrase):
+                return answer
         return self.fallback_response
 
     def reset(self):
-        pass  # no state to reset here
+        """Kept for API compatibility; this chatbot keeps no per-user state."""
 
 bot = SimpleChatbot()
 
@@ -260,6 +315,8 @@ HTML_TEMPLATE = """
                 chatModal.style.display = 'none';
             }
         }, 300);
+        // Return focus to the icon so keyboard users are not stranded.
+        chatIcon.focus();
     }
 
     chatIcon.addEventListener('click', () => {
@@ -269,6 +326,12 @@ HTML_TEMPLATE = """
     });
 
     closeBtn.addEventListener('click', closeChat);
+
+    document.addEventListener('keydown', e => {
+        if (e.key === 'Escape' && chatModal.classList.contains('show')) {
+            closeChat();
+        }
+    });
 
     window.addEventListener('click', e => {
         if (e.target === chatModal) {
@@ -284,9 +347,13 @@ HTML_TEMPLATE = """
         chatbox.scrollTop = chatbox.scrollHeight;
     }
 
+    let sending = false;
+
     function sendMessage() {
         const message = userInput.value.trim();
-        if (!message) return;
+        if (!message || sending) return;
+        sending = true;
+        sendBtn.disabled = true;
         appendMessage('user', message);
         userInput.value = '';
 
@@ -295,14 +362,22 @@ HTML_TEMPLATE = """
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({message})
         })
-        .then(response => response.json())
-        .then(data => {
-            appendMessage('bot', data.response);
+        .then(response => response.json().then(body => ({ok: response.ok, body})))
+        .then(({ok, body}) => {
+            appendMessage('bot', ok ? body.response : `Error: ${body.error || 'request failed'}`);
+        })
+        .catch(() => {
+            appendMessage('bot', 'Sorry, I could not reach the server. Please try again.');
+        })
+        .finally(() => {
+            sending = false;
+            sendBtn.disabled = false;
+            userInput.focus();
         });
     }
 
     sendBtn.addEventListener('click', sendMessage);
-    userInput.addEventListener('keypress', e => {
+    userInput.addEventListener('keydown', e => {
         if (e.key === 'Enter') {
             sendMessage();
         }
@@ -319,10 +394,20 @@ def index():
 
 @app.route("/ask", methods=["POST"])
 def ask():
-    data = request.get_json()
-    user_input = data.get("message", "")
-    reply = bot.ask(user_input)
-    return jsonify({"response": reply})
+    """Answer one message, rejecting anything that is not a short JSON string."""
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": 'Send a JSON body like {"message": "hi"}'}), 400
+
+    message = data.get("message", "")
+    if not isinstance(message, str):
+        return jsonify({"error": "message must be a string"}), 400
+    if len(message) > MAX_MESSAGE_LENGTH:
+        return jsonify(
+            {"error": f"message is longer than {MAX_MESSAGE_LENGTH} characters"}
+        ), 400
+
+    return jsonify({"response": bot.ask(message)})
 
 @app.route("/reset", methods=["POST"])
 def reset():
@@ -330,4 +415,10 @@ def reset():
     return jsonify({"response": "Chat reset."})
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    # debug stays off unless explicitly enabled: the Werkzeug debugger allows
+    # remote code execution and must never be on in a deployed instance.
+    app.run(
+        host=os.getenv("HOST", "127.0.0.1"),
+        port=int(os.getenv("PORT", "5000")),
+        debug=os.getenv("FLASK_DEBUG") == "1",
+    )
